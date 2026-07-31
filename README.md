@@ -54,8 +54,6 @@ UWB 노이즈, 원기둥 검출 조건, GTSAM noise model 및 초기화 조건
 
 ### `worlds/uwb_feature_world.world`
 
-Gazebo 실험 월드입니다.
-
 - 파란색 `anchor_A0`: `(0,0)`에 있는 UWB 앵커
 - 주황색 `landmark_0~3`: 반지름 `0.15 m`의 LiDAR 랜드마크
 - 외곽 벽과 박스 장애물
@@ -68,7 +66,7 @@ UWB 거리 메시지는 별도의 `uwb_range_sim` 노드가 생성
 
 ### `scripts/uwb_range_sim`
 
-실제 UWB 장치 대신 거리 측정값을 생성합니다.
+실제 UWB 장치 대신 거리 측정값 생성 후 발행
 
 1. `/gazebo/model_states`에서 로봇 위치 읽기
 2. 알려진 앵커 좌표까지의 2차원 거리를 계산

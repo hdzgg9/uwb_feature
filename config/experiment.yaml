@@ -1,0 +1,42 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+uwb_range_sim:
+  ros__parameters:
+    anchor_x: 0.0
+    anchor_y: 0.0
+    noise_stddev: 0.05
+    update_rate: 10.0
+    random_seed: 7
+
+circle_feature_detector:
+  ros__parameters:
+    cluster_distance: 0.16
+    min_cluster_points: 5
+    max_cluster_points: 45
+    expected_radius: 0.15
+    radius_tolerance: 0.055
+    max_fit_error: 0.035
+    track_gate: 0.30
+
+gtsam_fusion:
+  ros__parameters:
+    anchor_x: 0.0 
+    anchor_y: 0.0
+    odom_xy_sigma: 0.04
+    odom_yaw_sigma: 0.025
+    uwb_sigma: 0.08
+    feature_bearing_sigma: 0.035
+    feature_range_sigma: 0.06
+    local_landmark_gate: 0.35
+    inter_robot_inlier_gate: 0.30
+    minimum_common_landmarks: 3 # 최소 랜드마크 개수 지정
+    association_confirmations: 3
+    minimum_landmark_observations: 3
+    minimum_uwb_validation_samples: 5
+    maximum_uwb_initialization_rmse: 0.20
+    calibration_scans_per_confirmation: 10
+    keyframe_distance: 0.12
+    keyframe_angle: 0.10
+    tb3_0_initial_pose: [-0.978, 1.92, 0.0]

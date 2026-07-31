@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+import math
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
+from sensor_msgs.msg import Range
+from std_msgs.msg import Bool
+from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from uwb_feature_gtsam_sim.msg import CircleFeatureArray
+
+try:
+    import gtsam
+except ImportError:
+    gtsam = None
+
+
+def wrap(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def quaternion_from_yaw(yaw):
+    from geometry_msgs.msg import Quaternion
+    q = Quaternion()
+    q.z, q.w = math.sin(0.5 * yaw), math.cos(0.5 * yaw)
+    return q
+
+
+def pose_key(robot, index):
+    return gtsam.symbol('x' if robot == 'tb3_0' else 'y', index)
+
+
+def transform_point(pose, point):
+    return np.asarray(pose.transformFrom(np.asarray(point, dtype=float)))
+
+
+class GtsamFusion(Node):
+    """Initialize the joint graph from shared feature geometry, not truth poses."""
+
+    def __init__(self):
+        super().__init__('gtsam_fusion')
+        if gtsam is None:
+            raise RuntimeError('Python GTSAM is missing (expected gtsam==4.2).')
+        defaults = {
+            'anchor_x': 0.0, 'anchor_y': 0.0,
+            'odom_xy_sigma': 0.04, 'odom_yaw_sigma': 0.025,
+            'uwb_sigma': 0.08, 'feature_bearing_sigma': 0.035,
+            'feature_range_sigma': 0.06, 'local_landmark_gate': 0.35,
+            'inter_robot_inlier_gate': 0.30, 'minimum_common_landmarks': 3,
+            'association_confirmations': 3,
+            'minimum_landmark_observations': 3,
+            'minimum_uwb_validation_samples': 5,
+            'maximum_uwb_initialization_rmse': 0.20,
+            'calibration_scans_per_confirmation': 10,
+            'keyframe_distance': 0.12,
+            'keyframe_angle': 0.10,
+            'tb3_0_initial_pose': [-0.978, 1.92, 0.0],
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+        self.robots = ('tb3_0', 'tb3_1')
+        self.world0 = gtsam.Pose2(
+            *list(self.get_parameter('tb3_0_initial_pose').value))
+        self.anchor = np.array([
+            float(self.get_parameter('anchor_x').value),
+            float(self.get_parameter('anchor_y').value)])
+        self.local_gate = float(self.get_parameter('local_landmark_gate').value)
+        self.inter_gate = float(
+            self.get_parameter('inter_robot_inlier_gate').value)
+        self.min_common = int(
+            self.get_parameter('minimum_common_landmarks').value)
+        self.confirmations_needed = int(
+            self.get_parameter('association_confirmations').value)
+        self.min_landmark_observations = int(
+            self.get_parameter('minimum_landmark_observations').value)
+        self.min_uwb_samples = int(
+            self.get_parameter('minimum_uwb_validation_samples').value)
+        self.max_uwb_init_rmse = float(
+            self.get_parameter('maximum_uwb_initialization_rmse').value)
+        self.scans_per_confirmation = int(
+            self.get_parameter('calibration_scans_per_confirmation').value)
+        self.key_dist = float(self.get_parameter('keyframe_distance').value)
+        self.key_angle = float(self.get_parameter('keyframe_angle').value)
+        self.odom_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
+            float(self.get_parameter('odom_xy_sigma').value),
+            float(self.get_parameter('odom_xy_sigma').value),
+            float(self.get_parameter('odom_yaw_sigma').value)]))
+        self.uwb_noise = gtsam.noiseModel.Isotropic.Sigma(
+            1, float(self.get_parameter('uwb_sigma').value))
+        self.feature_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
+            float(self.get_parameter('feature_bearing_sigma').value),
+            float(self.get_parameter('feature_range_sigma').value)]))
+        self.prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.03, 0.03, 0.02]))
+
+        self.odom_origin = {r: None for r in self.robots}
+        self.latest_local_pose = {r: None for r in self.robots}
+        self.latest_uwb = {r: None for r in self.robots}
+        self.uwb_history = {r: [] for r in self.robots}
+        self.feature_scan_count = {r: 0 for r in self.robots}
+        self.keyframes = {r: [] for r in self.robots}
+        self.local_landmarks = {r: {} for r in self.robots}
+        self.local_counts = {r: {} for r in self.robots}
+        self.next_local_id = {r: 0 for r in self.robots}
+        self.matches = []
+        self.world_from_robot1 = None
+        self.initialized = False
+        self.candidate_signature = None
+        self.candidate_count = 0
+        self.last_confirmation_keyframes = None
+        self.result = None
+        self.map_transforms_frozen = False
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.pose_pubs = {
+            r: self.create_publisher(PoseStamped, f'/{r}/gtsam_pose', 10)
+            for r in self.robots}
+        ready_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.ready_pub = self.create_publisher(
+            Bool, '/alignment_ready', ready_qos)
+        self.ready_pub.publish(Bool(data=False))
+        for robot in self.robots:
+            self.create_subscription(
+                Odometry, f'/{robot}/odom',
+                lambda msg, r=robot: self.on_odom(r, msg), 50)
+            self.create_subscription(
+                Range, f'/{robot}/uwb_range',
+                lambda msg, r=robot: self.on_uwb(r, msg), 20)
+            self.create_subscription(
+                CircleFeatureArray, f'/{robot}/features',
+                lambda msg, r=robot: self.on_features(r, msg), 20)
+        # TF may not exist yet when the first odom factor is optimized.
+        self.create_timer(0.5, self.republish_available)
+        self.create_timer(5.0, self.log_calibration_status)
+        self.get_logger().info(
+            f'No tb3_1 pose/landmark truth loaded. Waiting for '
+            f'>={self.min_common} common landmarks.')
+
+    def log_calibration_status(self):
+        if self.initialized:
+            return
+        stable = {
+            robot: sum(
+                count >= self.min_landmark_observations
+                for count in self.local_counts[robot].values())
+            for robot in self.robots}
+        self.get_logger().info(
+            'CALIBRATING: stable landmarks '
+            f'tb3_0={stable["tb3_0"]}, tb3_1={stable["tb3_1"]}; '
+            f'scans=({self.feature_scan_count["tb3_0"]},'
+            f'{self.feature_scan_count["tb3_1"]}); '
+            f'UWB samples=({len(self.uwb_history["tb3_0"])},'
+            f'{len(self.uwb_history["tb3_1"])})')
+
+    def republish_available(self):
+        if self.result is None or not self.keyframes['tb3_0']:
+            return
+        self.publish_robot('tb3_0')
+        if self.initialized and self.keyframes['tb3_1']:
+            self.publish_robot('tb3_1')
+            self.freeze_map_transforms()
+
+    @staticmethod
+    def odom_pose(msg):
+        p = msg.pose.pose
+        return gtsam.Pose2(
+            p.position.x, p.position.y, yaw_from_quaternion(p.orientation))
+
+    def on_uwb(self, robot, msg):
+        self.latest_uwb[robot] = float(msg.range)
+        self.uwb_history[robot].append(float(msg.range))
+        self.uwb_history[robot] = self.uwb_history[robot][-100:]
+        if self.keyframes[robot]:
+            self.keyframes[robot][-1]['uwb'] = float(msg.range)
+
+    def on_odom(self, robot, msg):
+        odom = self.odom_pose(msg)
+        if self.odom_origin[robot] is None:
+            self.odom_origin[robot] = odom
+        local = self.odom_origin[robot].between(odom)
+        self.latest_local_pose[robot] = local
+        frames = self.keyframes[robot]
+        if frames:
+            delta = frames[-1]['pose'].between(local)
+            if math.hypot(delta.x(), delta.y()) < self.key_dist and \
+                    abs(delta.theta()) < self.key_angle:
+                return
+        frames.append({'pose': local, 'uwb': self.latest_uwb[robot], 'obs': {}})
+        if robot == 'tb3_0' or self.initialized:
+            self.optimize_and_publish()
+
+    def associate_local(self, robot, point):
+        best_id, best_distance = None, self.local_gate
+        for landmark_id, center in self.local_landmarks[robot].items():
+            distance = float(np.linalg.norm(point - center))
+            if distance < best_distance:
+                best_id, best_distance = landmark_id, distance
+        if best_id is None:
+            best_id = self.next_local_id[robot]
+            self.next_local_id[robot] += 1
+            self.local_landmarks[robot][best_id] = point
+            self.local_counts[robot][best_id] = 1
+        else:
+            count = self.local_counts[robot][best_id]
+            self.local_landmarks[robot][best_id] = (
+                count * self.local_landmarks[robot][best_id] + point) / (count + 1)
+            self.local_counts[robot][best_id] = count + 1
+        return best_id
+
+    def on_features(self, robot, msg):
+        if self.latest_local_pose[robot] is None or not self.keyframes[robot]:
+            return
+        frame = self.keyframes[robot][-1]
+        self.feature_scan_count[robot] += 1
+        for feature in msg.features:
+            point = transform_point(
+                self.latest_local_pose[robot],
+                [feature.center.x, feature.center.y])
+            local_id = self.associate_local(robot, point)
+            frame['obs'][local_id] = (feature.bearing, feature.range)
+        if not self.initialized:
+            self.try_initialize()
+        else:
+            self.optimize_and_publish()
+
+    @staticmethod
+    def two_point_transform(a0, a1, b0, b1):
+        da, db = a1 - a0, b1 - b0
+        if np.linalg.norm(da) < 0.25 or np.linalg.norm(db) < 0.25:
+            return None
+        yaw = wrap(math.atan2(da[1], da[0]) - math.atan2(db[1], db[0]))
+        c, s = math.cos(yaw), math.sin(yaw)
+        rotation = np.array([[c, -s], [s, c]])
+        translation = a0 - rotation @ b0
+        return gtsam.Pose2(float(translation[0]), float(translation[1]), yaw)
+
+    def consensus(self, transform):
+        candidates = []
+        stable0 = {
+            landmark_id: point
+            for landmark_id, point in self.local_landmarks['tb3_0'].items()
+            if self.local_counts['tb3_0'][landmark_id] >=
+            self.min_landmark_observations}
+        stable1 = {
+            landmark_id: point
+            for landmark_id, point in self.local_landmarks['tb3_1'].items()
+            if self.local_counts['tb3_1'][landmark_id] >=
+            self.min_landmark_observations}
+        for bid, bp in stable1.items():
+            transformed = transform_point(transform, bp)
+            for aid, ap in stable0.items():
+                distance = float(np.linalg.norm(transformed - ap))
+                if distance < self.inter_gate:
+                    candidates.append((distance, aid, bid))
+        matches, used_a, used_b, error = [], set(), set(), 0.0
+        for distance, aid, bid in sorted(candidates):
+            if aid not in used_a and bid not in used_b:
+                matches.append((aid, bid))
+                used_a.add(aid)
+                used_b.add(bid)
+                error += distance
+        return matches, error
+
+    def best_constellation_match(self):
+        a_items = [
+            item for item in self.local_landmarks['tb3_0'].items()
+            if self.local_counts['tb3_0'][item[0]] >=
+            self.min_landmark_observations]
+        b_items = [
+            item for item in self.local_landmarks['tb3_1'].items()
+            if self.local_counts['tb3_1'][item[0]] >=
+            self.min_landmark_observations]
+        if len(a_items) < self.min_common or len(b_items) < self.min_common:
+            return None
+        best = None
+        for ai, (_, a0) in enumerate(a_items):
+            for aj, (_, a1) in enumerate(a_items):
+                if ai == aj:
+                    continue
+                for bi, (_, b0) in enumerate(b_items):
+                    for bj, (_, b1) in enumerate(b_items):
+                        if bi == bj:
+                            continue
+                        if abs(np.linalg.norm(a1 - a0) -
+                               np.linalg.norm(b1 - b0)) > 2.0 * self.inter_gate:
+                            continue
+                        hypothesis = self.two_point_transform(a0, a1, b0, b1)
+                        if hypothesis is None:
+                            continue
+                        matches, error = self.consensus(hypothesis)
+                        uwb_rmse = self.uwb_initialization_rmse(hypothesis)
+                        if uwb_rmse is None or \
+                                uwb_rmse > self.max_uwb_init_rmse:
+                            continue
+                        score = (len(matches), -error, -uwb_rmse)
+                        if best is None or score > best[0]:
+                            best = (score, hypothesis, matches, uwb_rmse)
+        return best
+
+    def uwb_initialization_rmse(self, robot0_from_robot1):
+        if any(len(self.uwb_history[robot]) < self.min_uwb_samples
+               for robot in self.robots):
+            return None
+        world_from_robot1 = self.world0.compose(robot0_from_robot1)
+        pose0 = self.world0.compose(self.latest_local_pose['tb3_0'])
+        pose1 = world_from_robot1.compose(self.latest_local_pose['tb3_1'])
+        predicted = {
+            'tb3_0': math.hypot(
+                pose0.x() - self.anchor[0], pose0.y() - self.anchor[1]),
+            'tb3_1': math.hypot(
+                pose1.x() - self.anchor[0], pose1.y() - self.anchor[1])}
+        residuals = []
+        for robot in self.robots:
+            residuals.extend(
+                predicted[robot] - measurement
+                for measurement in self.uwb_history[robot][-50:])
+        return float(np.sqrt(np.mean(np.square(residuals))))
+
+    def try_initialize(self):
+        best = self.best_constellation_match()
+        if best is None or best[0][0] < self.min_common:
+            return
+        _, robot0_from_robot1, matches, uwb_rmse = best
+        signature = tuple(sorted(matches))
+        # Confirmation windows are independent batches of stationary scans.
+        confirmation_windows = tuple(
+            self.feature_scan_count[robot] // self.scans_per_confirmation
+            for robot in self.robots)
+        if min(confirmation_windows) < 1 or \
+                confirmation_windows == self.last_confirmation_keyframes:
+            return
+        self.last_confirmation_keyframes = confirmation_windows
+        if signature == self.candidate_signature:
+            self.candidate_count += 1
+        else:
+            self.candidate_signature, self.candidate_count = signature, 1
+        if self.candidate_count < self.confirmations_needed:
+            self.get_logger().info(
+                f'Common-landmark candidate {self.candidate_count}/'
+                f'{self.confirmations_needed}: {signature}, '
+                f'UWB RMSE={uwb_rmse:.3f} m')
+            return
+        self.matches = list(signature)
+        self.world_from_robot1 = self.world0.compose(robot0_from_robot1)
+        self.initialized = True
+        self.get_logger().warn(
+            f'JOINT GRAPH INITIALIZED from {len(self.matches)} common '
+            f'landmarks with UWB RMSE={uwb_rmse:.3f} m; '
+            f'world->tb3_1/map is now enabled.')
+        self.ready_pub.publish(Bool(data=True))
+        self.optimize_and_publish()
+
+    def build_graph(self):
+        graph, values = gtsam.NonlinearFactorGraph(), gtsam.Values()
+        anchor_key = gtsam.symbol('a', 0)
+        values.insert(anchor_key, self.anchor)
+        graph.add(gtsam.PriorFactorPoint2(
+            anchor_key, self.anchor,
+            gtsam.noiseModel.Isotropic.Sigma(2, 1e-4)))
+        robots = self.robots if self.initialized else ('tb3_0',)
+        origins = {'tb3_0': self.world0, 'tb3_1': self.world_from_robot1}
+        for robot in robots:
+            frames = self.keyframes[robot]
+            for index, frame in enumerate(frames):
+                values.insert(
+                    pose_key(robot, index), origins[robot].compose(frame['pose']))
+                if index:
+                    delta = frames[index - 1]['pose'].between(frame['pose'])
+                    graph.add(gtsam.BetweenFactorPose2(
+                        pose_key(robot, index - 1), pose_key(robot, index),
+                        delta, self.odom_noise))
+                if frame['uwb'] is not None:
+                    graph.add(gtsam.RangeFactor2D(
+                        pose_key(robot, index), anchor_key,
+                        frame['uwb'], self.uwb_noise))
+        if self.keyframes['tb3_0']:
+            graph.add(gtsam.PriorFactorPose2(
+                pose_key('tb3_0', 0), self.world0, self.prior_noise))
+
+        if self.initialized:
+            map0 = {aid: aid for aid, _ in self.matches}
+            map1 = {bid: aid for aid, bid in self.matches}
+            for aid, bid in self.matches:
+                p0 = transform_point(
+                    self.world0, self.local_landmarks['tb3_0'][aid])
+                p1 = transform_point(
+                    self.world_from_robot1,
+                    self.local_landmarks['tb3_1'][bid])
+                values.insert(gtsam.symbol('l', aid), 0.5 * (p0 + p1))
+            for robot, correspondence in (
+                    ('tb3_0', map0), ('tb3_1', map1)):
+                for index, frame in enumerate(self.keyframes[robot]):
+                    for local_id, measurement in frame['obs'].items():
+                        if local_id not in correspondence:
+                            continue
+                        bearing, distance = measurement
+                        graph.add(gtsam.BearingRangeFactor2D(
+                            pose_key(robot, index),
+                            gtsam.symbol('l', correspondence[local_id]),
+                            gtsam.Rot2.fromAngle(bearing), distance,
+                            self.feature_noise))
+        return graph, values
+
+    def optimize_and_publish(self):
+        if not self.keyframes['tb3_0']:
+            return
+        graph, values = self.build_graph()
+        try:
+            self.result = gtsam.LevenbergMarquardtOptimizer(
+                graph, values).optimize()
+        except RuntimeError as error:
+            self.get_logger().warn(f'Optimization deferred: {error}')
+            return
+        self.publish_robot('tb3_0')
+        if self.initialized and self.keyframes['tb3_1']:
+            self.publish_robot('tb3_1')
+            self.freeze_map_transforms()
+
+    def publish_robot(self, robot):
+        index = len(self.keyframes[robot]) - 1
+        pose = self.result.atPose2(pose_key(robot, index))
+        now = self.get_clock().now().to_msg()
+        msg = PoseStamped()
+        msg.header.stamp, msg.header.frame_id = now, 'world'
+        msg.pose.position.x, msg.pose.position.y = pose.x(), pose.y()
+        msg.pose.orientation = quaternion_from_yaw(pose.theta())
+        self.pose_pubs[robot].publish(msg)
+
+    def calculate_world_to_map(self, robot):
+        index = len(self.keyframes[robot]) - 1
+        pose = self.result.atPose2(pose_key(robot, index))
+        now = self.get_clock().now().to_msg()
+        try:
+            map_to_base = self.tf_buffer.lookup_transform(
+                f'{robot}/map', f'{robot}/base_footprint', Time(),
+                timeout=Duration(seconds=0.05))
+        except Exception:
+            return
+        mb = map_to_base.transform
+        wm_yaw = wrap(pose.theta() - yaw_from_quaternion(mb.rotation))
+        c, s = math.cos(wm_yaw), math.sin(wm_yaw)
+        transform = TransformStamped()
+        transform.header.stamp, transform.header.frame_id = now, 'world'
+        transform.child_frame_id = f'{robot}/map'
+        transform.transform.translation.x = pose.x() - (
+            c * mb.translation.x - s * mb.translation.y)
+        transform.transform.translation.y = pose.y() - (
+            s * mb.translation.x + c * mb.translation.y)
+        transform.transform.rotation = quaternion_from_yaw(wm_yaw)
+        return transform
+
+    def freeze_map_transforms(self):
+        if self.map_transforms_frozen or not self.initialized:
+            return
+        transforms = []
+        for robot in self.robots:
+            if not self.keyframes[robot]:
+                return
+            transform = self.calculate_world_to_map(robot)
+            if transform is None:
+                return
+            transforms.append(transform)
+        # Publish both transforms in one latched /tf_static message so late
+        # subscribers receive the complete frozen world-to-map alignment.
+        self.static_tf_broadcaster.sendTransform(transforms)
+        self.map_transforms_frozen = True
+        self.get_logger().warn(
+            'INITIAL MAP ALIGNMENT FROZEN: published static '
+            'world->tb3_0/map and world->tb3_1/map transforms.')
+
+
+def main():
+    rclpy.init()
+    try:
+        node = GtsamFusion()
+    except RuntimeError as error:
+        rclpy.logging.get_logger('gtsam_fusion').fatal(str(error))
+        rclpy.shutdown()
+        return
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

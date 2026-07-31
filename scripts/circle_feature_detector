@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import math
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from uwb_feature_gtsam_sim.msg import CircleFeature, CircleFeatureArray
+
+
+class CircleFeatureDetector(Node):
+    def __init__(self):
+        super().__init__('circle_feature_detector')
+        self.declare_parameter('robot_name', 'tb3_0')
+        for name, value in (
+            ('cluster_distance', 0.16), ('min_cluster_points', 5),
+            ('max_cluster_points', 45), ('expected_radius', 0.15),
+            ('radius_tolerance', 0.055), ('max_fit_error', 0.035),
+            ('track_gate', 0.30)):
+            self.declare_parameter(name, value)
+        self.robot = self.get_parameter('robot_name').value
+        self.cluster_distance = float(self.get_parameter('cluster_distance').value)
+        self.min_points = int(self.get_parameter('min_cluster_points').value)
+        self.max_points = int(self.get_parameter('max_cluster_points').value)
+        self.expected_radius = float(self.get_parameter('expected_radius').value)
+        self.radius_tolerance = float(self.get_parameter('radius_tolerance').value)
+        self.max_error = float(self.get_parameter('max_fit_error').value)
+        self.track_gate = float(self.get_parameter('track_gate').value)
+        self.tracks = {}
+        self.next_track = 0
+        self.pub = self.create_publisher(
+            CircleFeatureArray, f'/{self.robot}/features', 10)
+        self.create_subscription(
+            LaserScan, f'/{self.robot}/scan', self.on_scan, 10)
+
+    @staticmethod
+    def fit_circle(points):
+        x, y = points[:, 0], points[:, 1]
+        a = np.column_stack((2.0 * x, 2.0 * y, np.ones(len(x))))
+        b = x * x + y * y
+        try:
+            cx, cy, c = np.linalg.lstsq(a, b, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            return None
+        radius_sq = c + cx * cx + cy * cy
+        if radius_sq <= 0.0:
+            return None
+        radius = math.sqrt(radius_sq)
+        residual = np.sqrt(np.mean(
+            (np.hypot(x - cx, y - cy) - radius) ** 2))
+        return cx, cy, radius, residual
+
+    def assign_track(self, center, available):
+        best_id, best_dist = None, self.track_gate
+        for track_id in available:
+            d = float(np.linalg.norm(center - self.tracks[track_id]))
+            if d < best_dist:
+                best_id, best_dist = track_id, d
+        if best_id is None:
+            best_id = self.next_track
+            self.next_track += 1
+        else:
+            available.remove(best_id)
+        return best_id
+
+    def on_scan(self, msg):
+        ranges = np.asarray(msg.ranges, dtype=float)
+        angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        valid = np.isfinite(ranges) & (ranges >= msg.range_min) & (ranges <= msg.range_max)
+        indices = np.flatnonzero(valid)
+        clusters, current = [], []
+        previous_index, previous_point = None, None
+        for index in indices:
+            point = np.array([ranges[index] * math.cos(angles[index]),
+                              ranges[index] * math.sin(angles[index])])
+            contiguous = previous_index is not None and index == previous_index + 1
+            close = previous_point is not None and np.linalg.norm(point - previous_point) < self.cluster_distance
+            if current and not (contiguous and close):
+                clusters.append(np.asarray(current))
+                current = []
+            current.append(point)
+            previous_index, previous_point = index, point
+        if current:
+            clusters.append(np.asarray(current))
+
+        output = CircleFeatureArray()
+        output.header = msg.header
+        available = set(self.tracks)
+        new_tracks = {}
+        for points in clusters:
+            if not self.min_points <= len(points) <= self.max_points:
+                continue
+            fitted = self.fit_circle(points)
+            if fitted is None:
+                continue
+            cx, cy, radius, error = fitted
+            if abs(radius - self.expected_radius) > self.radius_tolerance or error > self.max_error:
+                continue
+            center = np.array([cx, cy])
+            track_id = self.assign_track(center, available)
+            new_tracks[track_id] = center
+            feature = CircleFeature()
+            feature.track_id = track_id
+            feature.landmark_id = -1
+            feature.center.x, feature.center.y = float(cx), float(cy)
+            feature.radius = float(radius)
+            feature.range = float(math.hypot(cx, cy))
+            feature.bearing = float(math.atan2(cy, cx))
+            feature.fit_error = float(error)
+            output.features.append(feature)
+        self.tracks = new_tracks
+        self.pub.publish(output)
+
+
+def main():
+    rclpy.init()
+    node = CircleFeatureDetector()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
